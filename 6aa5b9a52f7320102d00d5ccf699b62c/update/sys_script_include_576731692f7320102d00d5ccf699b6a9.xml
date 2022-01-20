@@ -1,0 +1,811 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_10255_arcsight_i.INGArcsightUtils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>INGArcsightUtils</name>
+        <script><![CDATA[var INGArcsightUtils = Class.create();
+INGArcsightUtils.prototype = {
+	initialize: function () {
+		this.userAcc = gs.getProperty('x_ingmb_arcsight_i.ing.arcsight.devops.user');
+		this.userPass = gs.getProperty('x_ingmb_arcsight_i.ing.arcsight.devops.pass');
+		this.defaultBusUser = gs.getProperty('x_ingmb_arcsight_i.ing.arcsight.devops.bususer');
+		this.instance = gs.getProperty('x_ingmb_arcsight_i.ing.arcsight.devops.instance');
+		this.devops_timeout = gs.getProperty('x_ingmb_arcsight_i.ing.arcsight.devops.timeout');
+	},
+
+	/**
+ 	* Main function called by the Create External Incident UI Action
+ 	* @param {obj} secInc - The SIR record the UI action was clicked from
+ 	*/
+	sendIncident: function (secInc) {
+		var groupCheck = this.checkSOAG(secInc);
+
+		if(groupCheck){
+			var succDesc = gs.getMessage('ing.arcsight.devops.description');
+			var ci = secInc.cmdb_ci.name;
+			var impact = '';
+			var urgency = '';
+			var busUser = this.defaultBusUser;
+			var callerUser = this.defaultBusUser;
+			var timeout = this.devops_timeout;
+			var enrichmentData = '';
+			var requestBody;
+			var responseBody;
+			var body;
+			var bodyEncode;
+			var status;
+			var sm;
+
+			if (global.JSUtil.nil(ci)) {
+				ci = secInc.u_device_host_name;
+			}
+
+			if (global.JSUtil.notNil(secInc.affected_user)) {
+				busUser = secInc.affected_user.user_name;
+			}
+
+			var enrichment = new GlideRecord('sn_si_m2m_incident_enrichment');
+			enrichment.addQuery('sn_si_incident', secInc.sys_id);
+			enrichment.orderBy('sys_created_on');
+			enrichment.query();
+
+			if (enrichment.next()) {
+				enrichmentData = enrichment.sn_sec_cmn_enrichment.raw_data;
+			}
+
+			var map = new GlideRecord('sn_si_external_instance_priority_mapping');
+			map.addQuery('u_external_instance', this.instance + '.service-now.com');
+			map.addQuery('u_sir_priority', secInc.priority);
+			map.query();
+
+			if (map.next()) {
+				impact = map.u_external_impact;
+				urgency = map.u_external_urgency;
+			}
+
+			body = {};
+			body["Short Description"] = secInc.short_description.toString();
+			body["Description"] = succDesc.toString();
+			body["Assignment Group"] = secInc.u_external_assignment_group.toString();
+			body["Support offering - L2"] = secInc.u_support_offering_l2.toString();
+			body["Contact type"] = 'Event';
+			body["Configuration item"] = ci.toString();
+			body["Security"] = 'true';
+			body["Business User"] = busUser.toString();
+			body["Caller"] = callerUser.toString();
+			body["External reference"] = secInc.number.toString();
+			body["Impact"] = impact.toString();
+			body["Urgency"] = urgency.toString();
+			body["Sensitive Data Encrypted"] = secInc.description.toString() + '\n' + enrichmentData.toString();
+
+			var endpoint = 'https://' + this.instance + '.service-now.com/api/ingg2/v17/itsm/incident';
+			gs.debug("Endpoint: " + endpoint);
+			try {
+				sm = new sn_ws.RESTMessageV2();
+				sm.setHttpMethod("post");
+				sm.setEndpoint(endpoint);
+				sm.setBasicAuth(this.userAcc, this.userPass);
+				sm.setRequestHeader("Accept", "Application/json");
+				sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+				sm.setHttpTimeout(timeout * 1000);
+				sm.setRequestBody(JSON.stringify(body));
+				response = sm.execute();
+
+				responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+				status = response.getStatusCode();
+			} catch (ex) {
+				responseBody = ex.getMessage();
+				//status = '500';
+				gs.error("DevOps integration error, related to " + secInc.number+ " SNAPI status code"+status, ex);
+				this.reportErrorMattermost(404, "devops", endpoint, "POST");
+			} finally {
+				requestBody = sm ? sm.getRequestBody() : null;
+			}
+
+			if (status == '422') {
+				/* If CI not found and 422 response received, send no CI */
+				body["Configuration item"] = '';
+
+				try {
+					sm.setRequestBody(JSON.stringify(body));
+					response = sm.execute();
+
+					responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+					status = response.getStatusCode();
+				} catch (ex) {
+					responseBody = ex.getMessage();
+					status = '500';
+					gs.error("DevOps integration error", ex);
+					this.reportErrorMattermost(404, "devops", endpoint, "POST");
+
+				} finally {
+					requestBody = sm ? sm.getRequestBody() : null;
+				}
+			}
+
+			if (status == '201') {
+				var externalIncident = this.updateSirToIncDetails(secInc, responseBody);
+				this.sendAttachments(secInc, externalIncident);
+			}
+			else {
+				gs.error("HTTP statuscode: " + status + ' responsebody: ' + responseBody);
+				this.reportErrorMattermost(status, "devops", endpoint, "POST");
+				this.updateSirToIncFailure(secInc, status, responseBody);
+			}
+		}else{
+
+
+			secInc.work_notes = "Not possible to create external incident in DevOps as Assignment group or Support Offering are not valid.";
+			secInc.update();
+		}
+	},
+
+	/**
+ 	* Updates the SIR record with the Incident number from External Instance
+ 	* @param {obj} secInc - The SIR record the UI action was clicked from
+ 	* @param {obj} responseBody - Response from the API call to External instance
+ 	*/
+	updateSirToIncDetails: function (secInc, responseBody) {
+
+		var secIncRec = new GlideRecord('sn_si_incident');
+		secIncRec.get(secInc.sys_id);
+
+		var inc = JSON.parse(responseBody);
+		secIncRec.u_external_incident = inc.result.data.number;
+		secIncRec.work_notes = "External incident has been raised in DevOps: " + inc.result.data.number;//STRY1196922
+		secIncRec.substate = 22;
+		secIncRec.u_link = "https://" + this.instance + ".service-now.com/nav_to.do?uri=%2Fincident.do%3Fsysparm_query%3Dnumber%3D" + inc.result.data.number;//STRY1594488
+		secIncRec.update();
+		return inc.result.data.number;
+
+	},
+
+	/**
+ 	* Updates the SIR record with the a work note detailing failure
+ 	* @param {obj} secInc - The SIR record the UI action was clicked from
+ 	* @param {obj} responseBody - Response from the API call to External instance
+ 	* @param {string} status - HTTP Status Code returned from External Instance
+ 	*/
+	updateSirToIncFailure: function (secInc, status, responseBody) {
+		var secIncRec = new GlideRecord('sn_si_incident');
+		secIncRec.get(secInc.sys_id);
+		var message = 'Failed to post INC to External Instance. Status - ' + status + '\n' + ' Response Body - ' + responseBody;
+		secIncRec.work_notes = message;
+		secIncRec.update();
+
+		gs.error(message);
+	},
+
+	/**
+ 	* Called from Scheduled Job to get all External Incidents with updates
+ 	*/
+	getExternalIncidents: function () {
+		var sm;
+		var responseBody;
+		var status;
+		var requestBody;
+		var parseBody;
+		var timeout = this.devops_timeout;
+
+		var currentGDT = new GlideDateTime();
+		currentGDT.subtract(300000);
+
+		var endpointPre = 'https://' + this.instance + '.service-now.com/api/ingg2/itsm/incident?updated>=' + currentGDT.toString() + '&External referenceSTARTSWITH=SIR&State=Resolved&^ORState=Closed&^ORState=Active';
+
+		var endpointPos = encodeURI(endpointPre);
+
+		try {
+			sm = new sn_ws.RESTMessageV2();
+			sm.setHttpMethod("get");
+			sm.setEndpoint(endpointPos);
+			sm.setRequestHeader("Accept", "Application/json");
+			sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+			sm.setBasicAuth(this.userAcc, this.userPass);
+			sm.setHttpTimeout(timeout * 1000);			
+			response = sm.execute();
+
+			responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+			status = response.getStatusCode();
+
+		} catch (ex) {
+			responseBody = ex.getMessage();
+			status = '500';
+			gs.error("DevOps integration error", ex);
+			this.reportErrorMattermost(404, "devops", endpointPos, "GET");
+		} finally {
+			requestBody = sm ? sm.getRequestBody() : null;
+		}
+
+		responseBody = responseBody.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+
+		var log = '';
+
+		if (status == 200) {
+			try {
+				parseBody = JSON.parse(responseBody);
+			} catch (err) {
+				parseBody = { "error": "Unable to parse JSON" };
+				gs.error("DevOps integration error", parseBody);
+			}
+
+			for (var i = 1, j = parseBody.result.length; i < j; i += 1) {
+				var num = parseBody.result[i].Number;
+				log += num + ', ';
+				this.updateIncToSir(num);
+			}
+
+		}
+	},
+
+	/**
+ 	* Updates the SIR record with updates from DevOps incident
+ 	* @param {string} number - Number of the DevOps incident
+ 	*/
+	updateIncToSir: function (number) {
+		gs.debug("Retrieving information from devops " + number);
+		var sm;
+		var responseBody;
+		var status;
+		var requestBody;
+		var parseBody;
+		var timeout = this.devops_timeout;
+
+		var endpoint = 'https://' + this.instance + '.service-now.com/api/ingg2/v2/itsm/incident/' + number;
+
+		try {
+			sm = new sn_ws.RESTMessageV2();
+			sm.setHttpMethod("get");
+			sm.setEndpoint(endpoint);
+			sm.setRequestHeader("Accept", "Application/json");
+			sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+			sm.setBasicAuth(this.userAcc, this.userPass);
+			sm.setHttpTimeout(timeout * 1000);
+			response = sm.execute();
+
+			responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+			status = response.getStatusCode();
+			gs.debug('Devops status code on get: ' + status + ' ' + responseBody);
+
+		} catch (ex) {
+			responseBody = ex.getMessage();
+			status = '500';
+			gs.error("DevOps integration error", ex);
+			this.reportErrorMattermost(404, "devops", endpoint, "GET");
+		} finally {
+			requestBody = sm ? sm.getRequestBody() : null;
+		}
+		//
+		responseBody = responseBody.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+
+		try {
+			parseBody = JSON.parse(responseBody);
+		} catch (err) {
+			parseBody = { "error": "Unable to parse JSON" };
+			gs.error("DevOps integration error", parseBody);
+
+		}
+
+		var sirRec = new GlideRecord('sn_si_incident');
+		sirRec.addQuery('u_external_incident', parseBody.result[1].Number);
+		sirRec.query();
+
+		if (sirRec.next()) {
+
+			gs.debug('Updating SIR - ' + sirRec.getValue('number') + ' For external INC - ' + parseBody.result[1].Number);
+			sirRec.u_external_cause_code = parseBody.result[1]["Cause code"];
+			sirRec.u_external_close_code = parseBody.result[1]["Close code"];
+			sirRec.u_external_solution = parseBody.result[1]["Solution"];
+			sirRec.u_support_offering_l2 = parseBody.result[1]["Support offering - L2"];
+			sirRec.u_external_assignment_group = parseBody.result[1]["Assignment group"];
+			sirRec.u_external_incident_state = parseBody.result[1]["Incident state"];
+
+			if (parseBody.result[1]["Incident state"] == "Active") {
+				sirRec.substate = 22;
+			}
+			var resolved = new GlideDateTime();
+			resolved.setDisplayValue(parseBody.result[1]["Resolved"]);
+			if (parseBody.result[1]["Resolved"] != '' && sirRec.getValue("u_external_resolved") != resolved.getValue()) { // fix for STRY2278937 SEM - Unable to "close" alert in SecOps
+		sirRec.substate = 23;
+		sirRec.u_external_resolved = parseBody.result[1]["Resolved"];
+}
+	sirRec.update();
+	}
+	},
+
+
+	updateIncident: function (sir) {
+		gs.info('Updating DevOps Incident with SIR number: ' + sir.getValue('number'));
+		var sm;
+		var responseBody;
+		var status;
+		var requestBody;
+		var parseBody;
+		var enrichmentData = '';
+		var timeout = this.devops_timeout;
+
+		var enrichment = new GlideRecord('sn_si_m2m_incident_enrichment');
+		enrichment.addQuery('sn_si_incident', sir.sys_id);
+		enrichment.orderBy('sys_created_on');
+		enrichment.query();
+
+		if (enrichment.next()) {
+			enrichmentData = enrichment.sn_sec_cmn_enrichment.raw_data;
+		}
+
+		var endpoint = 'https://' + this.instance + '.service-now.com/api/ingg2/v14/itsm/incident/' + sir.getValue('u_external_incident');// updated the post request to V17 due to INC4284420
+		try {
+			var body = {
+				"External reference": sir.getValue('number'),
+				"Sensitive Data Encrypted": sir.getValue('description') + '\n' + enrichmentData.toString()
+			};
+			sm = new sn_ws.RESTMessageV2();
+			sm.setHttpMethod("patch");
+			sm.setEndpoint(endpoint);
+			sm.setRequestHeader("Accept", "Application/json");
+			sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+			sm.setBasicAuth(this.userAcc, this.userPass);
+			sm.setHttpTimeout(timeout * 1000);            
+			sm.setRequestBody(JSON.stringify(body));
+			response = sm.execute();
+
+			responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+			status = response.getStatusCode();
+			gs.debug('Devops status code on patch: ' + status + ' ' + responseBody);
+
+		} catch (ex) {
+			responseBody = ex.getMessage();
+			status = '500';
+			gs.error("DevOps integration error", ex);
+			this.reportErrorMattermost(404, "devops", endpoint, "PATCH");
+		} finally {
+			requestBody = sm ? sm.getRequestBody() : null;
+		}
+		//
+		responseBody = responseBody.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+
+		try {
+			if (status == 200) {
+				parseBody = JSON.parse(responseBody);
+				gs.debug('Successful Update. ' + sir.getValue('number') + ', ArcSight ID: ' + sir.getValue('correlation_id') + responseBody);
+			}
+
+			this.updateIncToSir(sir.getValue('u_external_incident'));
+		} catch (err) {
+			parseBody = { "error": "Unable to parse JSON" };
+			gs.error("DevOps integration error", parseBody);
+		}
+	},
+
+	// Created for reopen of incident in DEVOPS
+
+	reopenIncident: function (rir, comments) {
+		gs.debug('Reopen DevOps Incident');
+		var secINC = new GlideRecord('sn_si_incident');
+		secINC.get(rir);
+		secINC.work_notes = "DevOps incident reopen reason: " + comments;
+		secINC.update();
+		var sm;
+		var responseBody;
+		var status;
+		var requestBody;
+		var parseBody;
+		var timeout = this.devops_timeout;
+
+		var endpoint = 'https://' + this.instance + '.service-now.com/api/ingg2/v16/itsm/incident/reopen/' + secINC.getValue('u_external_incident');
+
+		try {
+			var body = {
+				"comments": secINC.work_notes.getJournalEntry(1)
+			};
+			sm = new sn_ws.RESTMessageV2();
+			sm.setHttpMethod("patch");
+			sm.setEndpoint(endpoint);
+			sm.setRequestHeader("Accept", "Application/json");
+			sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+			sm.setBasicAuth(this.userAcc, this.userPass);
+			sm.setHttpTimeout(timeout * 1000);
+			sm.setRequestBody(JSON.stringify(body));
+			response = sm.execute();
+
+			responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+			status = response.getStatusCode();
+
+		} catch (ex) {
+			responseBody = ex.getMessage();
+			status = '500';
+			gs.error("DevOps integration error", ex);
+			this.reportErrorMattermost(404, "devops", endpoint, "PATCH");
+		} finally {
+			requestBody = sm ? sm.getRequestBody() : null;
+		}
+		//
+		responseBody = responseBody.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+
+		try {
+			parseBody = JSON.parse(responseBody);
+			gs.debug(responseBody);
+		} catch (err) {
+			parseBody = { "error": "Unable to parse JSON" };
+			gs.error("DevOps integration error", parseBody);
+		}
+	}, 
+
+
+	/**
+ 	* Using the META API checks if Assignment Group and Support Offering exist in External Instance
+ 	* @param {obj} current - Current SIR record
+ 	*/
+	checkSOAG: function (current) {
+
+		var sm;
+		var responseBody;
+		var groupStatus;
+		var response;
+		var requestBody;
+		var offeringStatus;
+		var groupEndpoint;
+		var offeringEndpoint;
+		var timeout = this.devops_timeout;
+
+		sm = new sn_ws.RESTMessageV2();
+		sm.setHttpMethod("get");
+		sm.setRequestHeader("Accept", "Application/json");
+		sm.setRequestHeader("Content-type", "Application/json; charset=utf-8");
+		sm.setBasicAuth(this.userAcc, this.userPass);
+		sm.setHttpTimeout(timeout * 1000);
+
+		//check if Assignment group is valid, if empty check only SO-L2
+		if(!gs.nil(current.u_external_assignment_group)){
+			groupEndpoint = encodeURI('https://' + this.instance + '.service-now.com/api/ingg2/v1/meta/group/' + current.u_external_assignment_group.replace(/\//g, "%2F"));
+
+			try {
+				sm.setEndpoint(groupEndpoint);
+				response = sm.execute();
+
+				responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+				groupStatus = response.getStatusCode();
+
+			} catch (ex) {
+				responseBody = ex.getMessage();
+				groupStatus = '500';
+				gs.error("DevOps integration error", ex);
+				this.reportErrorMattermost(404, "devops", endpoint, "GET");
+			} finally {
+				requestBody = sm ? sm.getRequestBody() : null;
+			}
+
+		}else{
+			groupStatus = 200;
+		}
+
+		//check SO-L2 return false if not valid
+		if(!gs.nil(current.u_support_offering_l2)){
+			offeringEndpoint = encodeURI('https://' + this.instance + '.service-now.com/api/ingg2/v1/meta/offering/support/' + current.u_support_offering_l2.replace(/\//g, "%2F"));
+
+			try {
+				sm.setEndpoint(offeringEndpoint);
+				response = sm.execute();
+
+				responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+				offeringStatus = response.getStatusCode();
+			} catch (ex) {
+				responseBody = ex.getMessage();
+				offeringStatus = '500';
+				gs.error("DevOps integration error", ex);
+				this.reportErrorMattermost(404, "devops", endpoint, "GET");
+			} finally {
+				requestBody = sm ? sm.getRequestBody() : null;
+			}
+		}
+
+
+		if (groupStatus == 200 && offeringStatus == 200) {
+			return true;
+		}
+		else {
+			return false;
+		}
+	},
+
+	sendAttachments: function (secInc, externalIncident) {
+		var attach = new GlideRecord('sys_attachment');
+		var timeout = this.devops_timeout;
+
+		attach.addQuery('table_sys_id', '=', secInc.sys_id + '');
+		attach.query();
+
+		if (attach.hasNext()) {
+			var body = {};
+			body.encryption = "yes";
+			body.attachment = {};
+
+
+			while (attach.next()) {
+				var content = new GlideSysAttachment().getContentBase64(attach);
+				body.attachment[attach.file_name] = content;
+			}
+
+			var endpoint = 'https://' + this.instance + '.service-now.com/api/ingg2/v14/itsm/incident/' + externalIncident;
+
+			gs.debug('endpoint attachment: ' + endpoint);
+			gs.debug('body: ' + JSON.stringify(body));
+
+			try {
+				sm = new sn_ws.RESTMessageV2();
+				sm.setHttpMethod("patch");
+				sm.setEndpoint(endpoint);
+				sm.setBasicAuth(this.userAcc, this.userPass);
+				sm.setRequestHeader("Accept", "Application/json");
+				sm.setRequestHeader("Content-type", "Application/json");
+				sm.setHttpTimeout(timeout * 1000);
+				sm.setRequestBody(JSON.stringify(body));
+				response = sm.execute();
+
+				responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+				status = response.getStatusCode();
+
+				if (status == 200) {
+					gs.debug("Attachment sent corretly: " + responseBody);
+				} else {
+					gs.debug("Something went wrong: " + responseBody);
+				}
+			} catch (ex) {
+				responseBody = ex.getMessage();
+				gs.error(responseBody);
+				status = '500';
+				this.reportErrorMattermost(404, "devops", endpoint, "PATCH");
+			}
+		}
+	},
+
+	/**
+ 	* Main function called by Business Rule on Security Incident when ArcSight SIR is updated
+ 	* @param {obj} SIR - The SIR record the business rule was fired from
+ 	*/
+	updateCase: function (SIR) {
+		var sirRec = new GlideRecord('sn_si_incident');
+		sirRec.get(SIR.sys_id);
+		var midServer = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_mid_server');
+		var token = this.getToken(midServer);
+
+		if (token != null) {
+			var putEndpoint = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_put_endpoint');
+			var timeout = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_update_timeout'); //timeout in seconds
+			var assignedTo;
+
+			var corpKey = new GlideRecord('sys_user');
+			corpKey.get(sirRec.getValue('assigned_to'));
+
+			if (corpKey.isValidRecord()) {
+				assignedTo = corpKey.getValue('user_name');
+			}
+
+			var sm;
+			var status;
+			var errorCode;
+			var responseBody;
+			var requestBody;
+			var host;
+			var body = {};
+			body["arcsightId"] = sirRec.getValue('correlation_id');
+			body["ticketType"] = this.checkNullValues(sirRec.getValue('u_tickettype'));
+			body["assigmentGroup"] = this.checkNullValues(sirRec.getDisplayValue('assignment_group'));
+			body["assigmentTo"] = this.checkNullValues(assignedTo);
+			body["phase"] = sirRec.getDisplayValue('state');
+			body["substate"] = sirRec.getDisplayValue('substate');
+			body["externalCloseCode"] = this.checkNullValues(sirRec.getValue('u_external_close_code'));
+			body["externalSolution"] = this.checkNullValues(sirRec.getValue('u_external_solution'));
+			body["sirCloseCode"] = this.checkNullValues(sirRec.getDisplayValue('close_code'));
+			body["sirSolution"] = this.checkNullValues(sirRec.getValue('close_notes'));
+			body["priority"] = this.checkNullValues(sirRec.getDisplayValue('priority'));
+			body["arcsightMessage"] = this.checkNullValues(sirRec.getValue('description'));
+			body["updated"] = sirRec.getValue('sys_updated_on');
+			body["updatedBy"] = sirRec.getValue('sys_updated_by');
+			body["externalIncident"] = this.checkNullValues(sirRec.getValue('u_external_incident'));
+			body["number"] = sirRec.getValue('number');//STRY1679391
+			host = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_endpoint');
+
+			try {
+				sm = new sn_ws.RESTMessageV2('Arcsight', 'Update');
+				sm.setStringParameterNoEscape('token', token);
+				sm.setStringParameterNoEscape('host', host);
+				sm.setStringParameterNoEscape('case_id', sirRec.getValue('correlation_id'));
+				sm.setEccParameter('skip_sensor', 'true');
+				sm.setMIDServer(midServer);
+				//the amount of time, in milliseconds, before the call to the REST provider times out.
+				sm.setHttpTimeout(timeout * 1000);
+				sm.setRequestBody(JSON.stringify(body));
+
+				gs.debug('Using endpoint: ' + sm.getEndpoint());
+				gs.debug('Request body: ' + sm.getRequestBody());
+
+				response = sm.executeAsync();
+				// we will not wait for the response as we don't need to process the results
+				//response.waitForResponse(timeout);// In seconds. Wait at most xx seconds to get response from ECC Queue/Mid Server //Might throw exception timing out waiting for response in ECC queue.
+
+				responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+				status = response.haveError() ? response.getErrorCode() : response.getStatusCode();
+			} catch (ex) {
+				responseBody = ex.getMessage();
+				errorCode = response.getErrorCode();
+				status = '500';
+				gs.error("DevOps integration error", ex);
+				var endpoint = host + "/api/v1/arcsight/case/" + sirRec.getValue('correlation_id');
+				this.reportErrorMattermost(404, "ducktape", endpoint, "PUT");
+			} finally {
+				requestBody = sm ? sm.getRequestBody() : null;
+			}
+
+			if (status == '200') {
+				gs.debug('Successful Update. ' + sirRec.getValue('number') + ', ArcSight ID: ' + sirRec.getValue('correlation_id') + responseBody);
+			}
+			else {
+				gs.error('Error ' + errorCode + ' making update. ' + sirRec.getValue('number') + ', ArcSight ID: ' + sirRec.getValue('correlation_id') + ' ' + responseBody + ' - Body: ' + JSON.stringify(body) + ' - Endpoint: ' + sm.getEndpoint());
+				var endpoint = host + "/api/v1/arcsight/case/" + sirRec.getValue('correlation_id');
+				this.reportErrorMattermost(status, "ducktape", endpoint, "PUT");
+			}
+		} else {
+			gs.error("Couldn't make the call to update. Missing Auth token, ArcSight ID: " + sirRec.getValue('correlation_id'));
+		}
+	},
+	/**
+ 	* Checks empty values to make sure 'null' value is not sent to ArcSight API
+ 	* @param {string} value - The value being checked
+ 	*/
+	checkNullValues: function (value) {
+
+		if (global.JSUtil.notNil(value)) {
+			return value;
+		}
+		else {
+			return '';
+		}
+
+	},
+	/**
+ 	* Gets an authorisation token from the ArcSight API ready for putting an update
+ 	* @param {string} midServer - The Mid Server used for the REST call
+ 	*/
+	getToken: function (midServer) {
+		var sm;
+		var status;
+		var errorCode;
+		var responseBody;
+		var requestBody;
+		var host;
+		var body = {};
+		var timeout = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_token_timeout'); //timeout in seconds
+		body["username"] = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_npa_user');
+		body["password"] = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_npa_pass');
+		host = gs.getProperty('x_ingmb_arcsight_i.arcsight_bidir_endpoint');
+		gs.debug('Using host: ' + host);
+		try {
+			sm = new sn_ws.RESTMessageV2('Arcsight', 'Authorization');
+			sm.setStringParameterNoEscape('host', host);
+			sm.setEccParameter('skip_sensor', 'true');
+			sm.setMIDServer(midServer);
+			sm.setHttpTimeout(timeout * 1000);
+			sm.setRequestBody(JSON.stringify(body));
+
+			gs.debug('Using endpoint: ' + sm.getEndpoint());
+			//gs.debug("Starting function to get security token from Arcsight");
+
+			response = sm.execute();
+			responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+			status = response.haveError() ? response.getErrorCode() : response.getStatusCode();
+			gs.debug('Auth response status code: ' + status);
+
+		} catch (ex) {
+			responseBody = ex.getMessage();
+			status = '500';
+			gs.error("DevOps integration error", ex);
+		} finally {
+			requestBody = sm ? sm.getRequestBody() : null;
+		}
+		if (status == '200') {
+			responseBody = JSON.parse(responseBody);
+			return responseBody.token;
+		}
+		else {
+			// STRY0998328 - Removed body from error message as we expose the password in the error log
+			gs.error('Error getting token: ' + responseBody + ' - Endpoint: ' + sm.getEndpoint());
+			var endpoint = host + "/api/v1/arcsight/auth";
+			this.reportErrorMattermost(status, "ducktape", endpoint, "POST");
+			return null;
+		}
+
+	},
+
+	reportErrorMattermost: function(errorCode, type, url, method){
+		var titles = {
+			"devops" : "[Alerting] DevOps integration",
+			"ducktape" : "[Alerting] Ducktape integration"
+		};
+		var thumbs = {
+			"devops" : "https://regmedia.co.uk/2018/05/09/servicenow_logo_supplied.jpg?x=648&y=324&crop=1",
+			"ducktape" : "https://encrypted-tbn0.gstatic.com/images?q=tbn%3AANd9GcQ8CbkX1HrTjc7PCAvf2AVuWhyCzEX7haNgN3aPJPRHVHocTmxI&usqp=CAU"
+		};
+
+		var instanceName = gs.getProperty('instance_name');
+		var channels = gs.getProperty('x_ingmb_arcsight_i.mattermost_channel');
+		channels = JSON.parse(channels);
+		var channel = channels[instanceName];
+		var title = titles[type];
+		var thumbURL = thumbs[type];
+
+		var template = {
+			"channel": channel,
+			"username":"SecOps Alerting",
+			"icon_url": "https://docs.servicenow.com/bundle/mobile-rn/page/release-notes/mobile-apps/agent/image/now-agent-icon.png",
+			"text": "#### ArcSight Alert",
+			"attachments": [
+				{
+					"color": "#D63232",
+					"pretext": ":fire: <http://"+ instanceName +".service-now.com/login.do|Arcsight integration error: HTTP Status "+ errorCode +">",      
+					"title": title,
+					"author_name":"x_ingmb_arcsight_i",
+					"thumb_url": thumbURL, 
+					"fields": [
+						{
+							"short":false,
+							"title":"URL",
+							"value": url
+						},
+						{
+							"short":true,
+							"title":"HTTP method",
+							"value": method
+						},
+						{
+							"short":true,
+							"title":"Created",
+							"value": new GlideDateTime().getValue()
+						}
+					],
+					"footer":"Powered by ServiceNow",
+					"footer_icon":"https://platform.slack-edge.com/img/default_application_icon.png"
+				}
+			],
+			"parse": "full"
+		};
+
+		this.sendMattermostMessage(template);
+
+	},
+
+	sendMattermostMessage: function(body){
+		try { 
+			var r = new sn_ws.RESTMessageV2('x_ingmb_arcsight_i.Arcsight', 'Report to Mattermost');
+
+			r.setRequestBody(JSON.stringify(body));
+
+			var response = r.execute();
+			var responseBody = response.getBody();
+			var httpStatus = response.getStatusCode();
+		}
+		catch(ex) {
+			var message = ex.message;
+			gs.error('MATTERMOST: ' + message);
+		}
+	},
+
+	type: 'INGArcsightUtils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-28 13:49:56</sys_created_on>
+        <sys_id>576731692f7320102d00d5ccf699b6a9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>INGArcsightUtils</sys_name>
+        <sys_package display_value="Arcsight Interface" source="x_10255_arcsight_i">6aa5b9a52f7320102d00d5ccf699b62c</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Arcsight Interface">6aa5b9a52f7320102d00d5ccf699b62c</sys_scope>
+        <sys_update_name>sys_script_include_576731692f7320102d00d5ccf699b6a9</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-28 13:49:56</sys_updated_on>
+    </sys_script_include>
+</record_update>

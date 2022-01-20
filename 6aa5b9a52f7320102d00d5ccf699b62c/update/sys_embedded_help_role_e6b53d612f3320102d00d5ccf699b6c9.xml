@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_embedded_help_role">
+    <sys_embedded_help_role action="INSERT_OR_UPDATE">
+        <order>1000</order>
+        <role display_value="x_10255_arcsight_i.arcsight" name="x_10255_arcsight_i.arcsight">6eb53d612f3320102d00d5ccf699b6c5</role>
+        <sys_class_name>sys_embedded_help_role</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-28 13:41:28</sys_created_on>
+        <sys_id>e6b53d612f3320102d00d5ccf699b6c9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>6eb53d612f3320102d00d5ccf699b6c5</sys_name>
+        <sys_package display_value="Arcsight Interface" source="x_10255_arcsight_i">6aa5b9a52f7320102d00d5ccf699b62c</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Arcsight Interface">6aa5b9a52f7320102d00d5ccf699b62c</sys_scope>
+        <sys_update_name>sys_embedded_help_role_e6b53d612f3320102d00d5ccf699b6c9</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-28 13:41:28</sys_updated_on>
+    </sys_embedded_help_role>
+</record_update>

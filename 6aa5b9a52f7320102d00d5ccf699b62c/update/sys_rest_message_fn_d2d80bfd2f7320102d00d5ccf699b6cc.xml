@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_rest_message_fn">
+    <sys_rest_message_fn action="INSERT_OR_UPDATE">
+        <authentication_type>inherit_from_parent</authentication_type>
+        <basic_auth_password/>
+        <basic_auth_profile/>
+        <basic_auth_user/>
+        <content/>
+        <function_name>Update</function_name>
+        <http_method>put</http_method>
+        <lock>false</lock>
+        <oauth2_profile/>
+        <protocol_name/>
+        <qualified_name>Arcsight [ Update ]</qualified_name>
+        <rest_endpoint>https://${host}/api/v1/arcsight/case/${case_id}</rest_endpoint>
+        <rest_message display_value="Arcsight">f338c3bd2f7320102d00d5ccf699b67b</rest_message>
+        <sys_class_name>sys_rest_message_fn</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-29 14:24:47</sys_created_on>
+        <sys_id>d2d80bfd2f7320102d00d5ccf699b6cc</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Update</sys_name>
+        <sys_package display_value="Arcsight Interface" source="x_10255_arcsight_i">6aa5b9a52f7320102d00d5ccf699b62c</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Arcsight Interface">6aa5b9a52f7320102d00d5ccf699b62c</sys_scope>
+        <sys_update_name>sys_rest_message_fn_d2d80bfd2f7320102d00d5ccf699b6cc</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-29 14:24:47</sys_updated_on>
+        <use_basic_auth>false</use_basic_auth>
+        <use_mid_server/>
+        <use_mutual_auth>false</use_mutual_auth>
+    </sys_rest_message_fn>
+</record_update>
